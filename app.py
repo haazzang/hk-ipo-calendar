@@ -30,6 +30,7 @@ CALENDAR_CSS = """
   border-radius: 4px;
 }
 .event.bookbuilding { border-color: #1f77b4; }
+.event.application { border-color: #ff7f0e; }
 .event.trade { border-color: #2ca02c; }
 .out-of-month {
   color: #bbb;
@@ -46,6 +47,7 @@ CALENDAR_CSS = """
   background: #f4f4f4;
 }
 .legend.bookbuilding { border: 1px solid #1f77b4; }
+.legend.application { border: 1px solid #ff7f0e; }
 .legend.trade { border: 1px solid #2ca02c; }
 </style>
 """
@@ -133,6 +135,10 @@ def build_terms_table(item: Dict) -> Dict:
     subscription_price_hkd = item.get("subscription_price_hkd")
     if subscription_price_hkd:
         terms["IPO price (HKD)"] = format_hkd(subscription_price_hkd, is_price=True)
+    if item.get("application_board"):
+        terms["Application board"] = item.get("application_board")
+    if item.get("application_status"):
+        terms["Application status"] = item.get("application_status")
     return terms
 
 
@@ -253,6 +259,7 @@ if meta.get("errors"):
 
 st.markdown(
     "<span class='legend bookbuilding'>Prospectus/Bookbuilding</span>"
+    "<span class='legend application'>Application proof</span>"
     "<span class='legend trade'>Listing/Trade</span>",
     unsafe_allow_html=True,
 )
@@ -264,3 +271,25 @@ render_calendar(year, month, all_events)
 
 selected_events = all_events.get(selected_date, [])
 render_details(selected_date, selected_events, enable_filings)
+
+application_only = [
+    item
+    for item in items
+    if item.get("bookbuilding_type") == "application" and not item.get("trade_date")
+]
+if application_only:
+    st.subheader("Application proof (no listing date yet)")
+    rows = [
+        {
+            "Company": item.get("company", "Unknown"),
+            "First posting": format_date(item.get("bookbuilding_start")),
+            "Board": item.get("application_board") or "N/A",
+            "Status": item.get("application_status") or "N/A",
+        }
+        for item in sorted(
+            application_only,
+            key=lambda entry: (entry.get("bookbuilding_start") or date.min, entry.get("company", "")),
+            reverse=True,
+        )
+    ]
+    st.dataframe(rows, use_container_width=True, height=320)

@@ -40,6 +40,11 @@ HKEX_NEW_LISTING_MAIN_URL = (
     f"{HKEX_NEWS_BASE}/New-Listings/New-Listing-Information/Main-Board?sc_lang=en"
 )
 HKEX_NEW_LISTING_REPORT_SEGMENT = "/New-Listing-Report/Main/"
+HKEX_APPLICATION_PROOF_URL = "https://www1.hkexnews.hk/app/appindex.html"
+HKEX_APPLICATION_INDEX_URLS = [
+    ("Main Board", "https://www1.hkexnews.hk/app/documents/sehkconsolidatedindex.xlsx"),
+    ("GEM", "https://www1.hkexnews.hk/app/documents/gemconsolidatedindex.xlsx"),
+]
 HKEX_SEARCH_ENDPOINTS = [
     ("servlet", f"{HKEX_NEWS_HOST}/search/titleSearchServlet.do", "post"),
     ("xhtml", f"{HKEX_NEWS_HOST}/search/titlesearch.xhtml", "get"),
@@ -220,13 +225,17 @@ def _shift_sample_to_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     errors: List[str] = []
     if use_live:
+        items: List[Dict[str, Any]] = []
         try:
-            items = _fetch_new_listing_report_calendar()
-            if items:
-                return items, {"source": "hkex-news", "errors": errors}
-            errors.append("HKEX new listing report returned empty data")
+            items.extend(_fetch_new_listing_report_calendar())
         except Exception as exc:  # noqa: BLE001
             errors.append(f"HKEX new listing report fetch failed: {exc}")
+        try:
+            items.extend(_fetch_application_proof_items())
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"HKEX application proof fetch failed: {exc}")
+        if items:
+            return items, {"source": "hkex-news", "errors": errors}
         try:
             items = _fetch_ipo_calendar_hkex()
             if items:
@@ -288,6 +297,59 @@ def _fetch_new_listing_report_calendar() -> List[Dict[str, Any]]:
 
     items = [normalize_calendar_item(item) for item in items]
     return items
+
+
+def _fetch_application_proof_items() -> List[Dict[str, Any]]:
+    if pd is None:
+        raise RuntimeError("pandas/openpyxl not available for application proof index")
+    session = _session()
+    items: List[Dict[str, Any]] = []
+    for board, url in HKEX_APPLICATION_INDEX_URLS:
+        response = session.get(url, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        try:
+            df = pd.read_excel(BytesIO(response.content))
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to parse application proof index: {exc}") from exc
+        date_col = _find_column(df, ["Date of First Posting"])
+        applicant_col = _find_column(df, ["Applicant"])
+        status_col = _find_column(df, ["Status"])
+        if not date_col or not applicant_col:
+            continue
+        for _, row in df.iterrows():
+            posting_date = safe_parse_date(row.get(date_col))
+            applicant = str(row.get(applicant_col) or "").strip()
+            status = str(row.get(status_col) or "").strip() if status_col else ""
+            if not applicant or not posting_date:
+                continue
+            items.append(
+                {
+                    "company": applicant,
+                    "stock_code": "",
+                    "industry": "",
+                    "application_status": status,
+                    "application_board": board,
+                    "application_proof_date": posting_date,
+                    "bookbuilding_start": posting_date,
+                    "bookbuilding_end": posting_date,
+                    "bookbuilding_label": "Application proof",
+                    "bookbuilding_type": "application",
+                    "trade_date": None,
+                    "trade_label": "Listing date",
+                    "company_page_url": HKEX_APPLICATION_PROOF_URL,
+                    "source": "application-proof",
+                }
+            )
+    return items
+
+
+def _find_column(df: Any, candidates: List[str]) -> Optional[str]:
+    columns = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        key = candidate.strip().lower()
+        if key in columns:
+            return columns[key]
+    return None
 
 
 def _extract_listing_report_links(html: str) -> List[str]:
@@ -542,6 +604,7 @@ def build_event_index(items: Iterable[Dict[str, Any]]) -> Dict[date, List[Dict[s
         book_end = item.get("bookbuilding_end")
         trade_date = item.get("trade_date")
         book_label = item.get("bookbuilding_label", "Bookbuilding")
+        book_type = item.get("bookbuilding_type", "bookbuilding")
         trade_label = item.get("trade_label", "Trade")
 
         if book_start and book_end:
@@ -549,7 +612,7 @@ def build_event_index(items: Iterable[Dict[str, Any]]) -> Dict[date, List[Dict[s
             while current <= book_end:
                 events.setdefault(current, []).append(
                     {
-                        "type": "bookbuilding",
+                        "type": book_type,
                         "label": book_label,
                         "item": item,
                     }

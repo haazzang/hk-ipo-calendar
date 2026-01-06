@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urljoin
 import calendar
 import json
 import os
@@ -13,6 +14,11 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    pd = None
 
 try:
     from pypdf import PdfReader
@@ -29,6 +35,11 @@ HKEX_IPO_CALENDAR_URLS = [
 ]
 HKEX_IPO_CALENDAR_URLS = [url for url in HKEX_IPO_CALENDAR_URLS if url]
 HKEX_NEWS_HOST = "https://www1.hkexnews.hk"
+HKEX_NEWS_BASE = "https://www2.hkexnews.hk"
+HKEX_NEW_LISTING_MAIN_URL = (
+    f"{HKEX_NEWS_BASE}/New-Listings/New-Listing-Information/Main-Board?sc_lang=en"
+)
+HKEX_NEW_LISTING_REPORT_SEGMENT = "/New-Listing-Report/Main/"
 HKEX_SEARCH_ENDPOINTS = [
     ("servlet", f"{HKEX_NEWS_HOST}/search/titleSearchServlet.do", "post"),
     ("xhtml", f"{HKEX_NEWS_HOST}/search/titlesearch.xhtml", "get"),
@@ -138,6 +149,21 @@ def normalize_company_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
 
+def normalize_stock_code(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:
+        return ""
+    text = str(value).strip()
+    if not text or text in {"\"", "-"}:
+        return ""
+    text = text.replace(".HK", "").replace("HK", "")
+    text = text.strip()
+    if text.isdigit():
+        return f"{int(text):05d}"
+    return text
+
+
 def normalize_calendar_item(item: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(item)
     normalized["bookbuilding_start"] = safe_parse_date(item.get("bookbuilding_start"))
@@ -195,6 +221,13 @@ def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dic
     errors: List[str] = []
     if use_live:
         try:
+            items = _fetch_new_listing_report_calendar()
+            if items:
+                return items, {"source": "hkex-news", "errors": errors}
+            errors.append("HKEX new listing report returned empty data")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"HKEX new listing report fetch failed: {exc}")
+        try:
             items = _fetch_ipo_calendar_hkex()
             if items:
                 return items, {"source": "hkex", "errors": errors}
@@ -220,6 +253,165 @@ def _fetch_ipo_calendar_hkex() -> List[Dict[str, Any]]:
     if last_error:
         raise RuntimeError(last_error)
     raise RuntimeError("HKEX IPO calendar endpoint list is empty.")
+
+
+def _fetch_new_listing_report_calendar() -> List[Dict[str, Any]]:
+    if pd is None:
+        raise RuntimeError("pandas/openpyxl not available for HKEX listing report")
+    session = _session()
+    response = session.get(HKEX_NEW_LISTING_MAIN_URL, timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    html = response.text
+
+    report_links = _extract_listing_report_links(html)
+    documents = _extract_new_listing_documents(html)
+    items: List[Dict[str, Any]] = []
+
+    for link in report_links:
+        items.extend(_parse_listing_report(link))
+
+    if documents:
+        for item in items:
+            code = normalize_stock_code(item.get("stock_code"))
+            doc = documents.get(code)
+            if not doc:
+                continue
+            item.update(doc)
+            if not item.get("company") and doc.get("company"):
+                item["company"] = doc["company"]
+            if not item.get("company_page_url"):
+                item["company_page_url"] = (
+                    doc.get("prospectus_url")
+                    or doc.get("announcement_url")
+                    or HKEX_NEW_LISTING_MAIN_URL
+                )
+
+    items = [normalize_calendar_item(item) for item in items]
+    return items
+
+
+def _extract_listing_report_links(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: List[str] = []
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if not href.lower().endswith(".xlsx"):
+            continue
+        if HKEX_NEW_LISTING_REPORT_SEGMENT.lower() not in href.lower():
+            continue
+        links.append(urljoin(HKEX_NEWS_BASE, href))
+
+    def sort_key(url: str) -> int:
+        match = re.search(r"(\\d{4})", url)
+        return int(match.group(1)) if match else 0
+
+    return sorted(set(links), key=sort_key, reverse=True)
+
+
+def _extract_new_listing_documents(html: str) -> Dict[str, Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    listing_table = None
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True) for th in table.find_all("th")]
+        if headers and "Stock Code" in headers and "Stock Name" in headers:
+            listing_table = table
+            break
+    if not listing_table:
+        return {}
+    documents: Dict[str, Dict[str, Any]] = {}
+    for row in listing_table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 5:
+            continue
+        stock_code = normalize_stock_code(cells[0].get_text(strip=True))
+        if not stock_code:
+            continue
+        company = cells[1].get_text(" ", strip=True)
+        announcement_url = _first_link(cells[2])
+        prospectus_url = _first_link(cells[3])
+        allotment_url = _first_link(cells[4])
+        documents[stock_code] = {
+            "company": company,
+            "announcement_url": announcement_url,
+            "prospectus_url": prospectus_url,
+            "allotment_url": allotment_url,
+        }
+    return documents
+
+
+def _first_link(cell: BeautifulSoup) -> Optional[str]:
+    anchor = cell.find("a", href=True)
+    if not anchor:
+        return None
+    return urljoin(HKEX_NEWS_BASE, anchor["href"])
+
+
+def _parse_listing_report(url: str) -> List[Dict[str, Any]]:
+    if pd is None:
+        return []
+    try:
+        raw = pd.read_excel(url, header=None)
+    except Exception:  # noqa: BLE001
+        return []
+    header_row = _find_listing_report_header(raw)
+    if header_row is None:
+        return []
+    rows = raw.iloc[header_row + 1 :]
+    items: List[Dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        if pd.isna(row[0]):
+            continue
+        stock_code = normalize_stock_code(row[1])
+        if not stock_code:
+            continue
+        company = str(row[2]).replace("\n", " ").strip()
+        prospectus_date = safe_parse_date(row[3])
+        listing_date = safe_parse_date(row[4])
+        funds_raised_hkd = _parse_float(row[8])
+        subscription_price_hkd = _parse_float(row[9])
+        item = {
+            "company": company,
+            "stock_code": stock_code,
+            "industry": "",
+            "prospectus_date": prospectus_date,
+            "listing_date": listing_date,
+            "funds_raised_hkd": funds_raised_hkd,
+            "subscription_price_hkd": subscription_price_hkd,
+            "bookbuilding_start": prospectus_date,
+            "bookbuilding_end": prospectus_date,
+            "bookbuilding_label": "Prospectus",
+            "trade_date": listing_date,
+            "trade_label": "Listing date",
+            "company_page_url": HKEX_NEW_LISTING_MAIN_URL,
+        }
+        items.append(item)
+    return items
+
+
+def _find_listing_report_header(raw: Any) -> Optional[int]:
+    for idx, row in raw.iterrows():
+        values = [str(value) for value in row.tolist() if value is not None]
+        if any("Stock Code" in value for value in values) and any(
+            "Company Name" in value for value in values
+        ):
+            return idx
+    return None
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(",", "").strip()
+    if not text or text == "-":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def _extract_calendar_from_html(html: str) -> List[Dict[str, Any]]:
@@ -349,6 +541,8 @@ def build_event_index(items: Iterable[Dict[str, Any]]) -> Dict[date, List[Dict[s
         book_start = item.get("bookbuilding_start")
         book_end = item.get("bookbuilding_end")
         trade_date = item.get("trade_date")
+        book_label = item.get("bookbuilding_label", "Bookbuilding")
+        trade_label = item.get("trade_label", "Trade")
 
         if book_start and book_end:
             current = book_start
@@ -356,14 +550,14 @@ def build_event_index(items: Iterable[Dict[str, Any]]) -> Dict[date, List[Dict[s
                 events.setdefault(current, []).append(
                     {
                         "type": "bookbuilding",
-                        "label": "Bookbuilding",
+                        "label": book_label,
                         "item": item,
                     }
                 )
                 current += timedelta(days=1)
         if trade_date:
             events.setdefault(trade_date, []).append(
-                {"type": "trade", "label": "Trade", "item": item}
+                {"type": "trade", "label": trade_label, "item": item}
             )
     return events
 
@@ -371,22 +565,66 @@ def build_event_index(items: Iterable[Dict[str, Any]]) -> Dict[date, List[Dict[s
 def fetch_ipo_details(item: Dict[str, Any]) -> Dict[str, Any]:
     overrides = load_overrides()
     company = item.get("company", "")
-    key = normalize_company_key(company)
-    if key and key in overrides:
-        return overrides[key]
+    stock_code = normalize_stock_code(item.get("stock_code"))
+    for key in (normalize_company_key(company), stock_code):
+        if key and key in overrides:
+            return overrides[key]
 
-    filings = search_hkex_filings(company)
+    filings: List[Filing] = []
+    prospectus_date = item.get("prospectus_date")
+    listing_date = item.get("listing_date")
+    announcement_url = item.get("announcement_url")
+    prospectus_url = item.get("prospectus_url")
+    allotment_url = item.get("allotment_url")
+
+    if announcement_url:
+        filings.append(
+            Filing(
+                title="New listing announcement",
+                url=announcement_url,
+                published_date=safe_parse_date(prospectus_date),
+                source="hkexnews",
+            )
+        )
+    if prospectus_url:
+        filings.append(
+            Filing(
+                title="Prospectus",
+                url=prospectus_url,
+                published_date=safe_parse_date(prospectus_date),
+                source="hkexnews",
+            )
+        )
+    if allotment_url:
+        filings.append(
+            Filing(
+                title="Allotment results",
+                url=allotment_url,
+                published_date=safe_parse_date(listing_date),
+                source="hkexnews",
+            )
+        )
+
+    if company:
+        filings.extend(search_hkex_filings(company))
+    filings = _dedupe_filings(filings)
     term_sheet = select_term_sheet(filings)
     extracted_terms: Dict[str, Any] = {}
 
     if term_sheet and term_sheet.url.lower().endswith(".pdf"):
         extracted_terms = extract_terms_from_pdf(term_sheet.url)
 
+    raise_amount_usd = extracted_terms.get("raise_amount_usd")
+    if raise_amount_usd is None:
+        funds_raised_hkd = _parse_float(item.get("funds_raised_hkd"))
+        if funds_raised_hkd is not None:
+            raise_amount_usd = convert_to_usd(funds_raised_hkd, "HKD")
+
     return {
         "term_sheet_url": term_sheet.url if term_sheet else None,
         "filings": [filing.__dict__ for filing in filings[:6]],
         "ipo_value_usd": extracted_terms.get("ipo_value_usd"),
-        "raise_amount_usd": extracted_terms.get("raise_amount_usd"),
+        "raise_amount_usd": raise_amount_usd,
         "valuation_multiple": extracted_terms.get("valuation_multiple"),
         "business_model": extracted_terms.get("business_model"),
         "financial_trend": extracted_terms.get("financial_trend"),

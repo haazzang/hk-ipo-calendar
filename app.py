@@ -6,6 +6,7 @@ import streamlit as st
 
 from hkex_client import (
     build_event_index,
+    convert_to_usd,
     fetch_ipo_calendar,
     fetch_ipo_details,
     format_money,
@@ -56,8 +57,28 @@ def load_calendar(use_live: bool):
 
 
 @st.cache_data(ttl=1800)
-def load_details(company: str) -> Dict:
-    return fetch_ipo_details({"company": company})
+def load_details(
+    company: str,
+    stock_code: str,
+    prospectus_url: str,
+    announcement_url: str,
+    allotment_url: str,
+    funds_raised_hkd: float,
+    prospectus_date: date,
+    listing_date: date,
+) -> Dict:
+    return fetch_ipo_details(
+        {
+            "company": company,
+            "stock_code": stock_code,
+            "prospectus_url": prospectus_url,
+            "announcement_url": announcement_url,
+            "allotment_url": allotment_url,
+            "funds_raised_hkd": funds_raised_hkd,
+            "prospectus_date": prospectus_date,
+            "listing_date": listing_date,
+        }
+    )
 
 
 def truncate_text(value: str, max_len: int = 16) -> str:
@@ -95,11 +116,24 @@ def format_date(value: date) -> str:
 
 
 def build_terms_table(item: Dict) -> Dict:
-    return {
-        "Bookbuilding": _format_range(item.get("bookbuilding_start"), item.get("bookbuilding_end")),
-        "Trade date": format_date(item.get("trade_date")),
-        "Industry": item.get("industry") or "N/A",
+    bookbuilding_label = item.get("bookbuilding_label", "Bookbuilding")
+    trade_label = item.get("trade_label", "Trade date")
+    terms = {
+        "Stock code": item.get("stock_code") or "N/A",
+        bookbuilding_label: _format_range(
+            item.get("bookbuilding_start"), item.get("bookbuilding_end")
+        ),
+        trade_label: format_date(item.get("trade_date")),
     }
+    if item.get("industry"):
+        terms["Industry"] = item.get("industry")
+    funds_raised_hkd = item.get("funds_raised_hkd")
+    if funds_raised_hkd:
+        terms["Funds raised (HKD)"] = format_hkd(funds_raised_hkd)
+    subscription_price_hkd = item.get("subscription_price_hkd")
+    if subscription_price_hkd:
+        terms["IPO price (HKD)"] = format_hkd(subscription_price_hkd, is_price=True)
+    return terms
 
 
 def _format_range(start: date, end: date) -> str:
@@ -108,6 +142,18 @@ def _format_range(start: date, end: date) -> str:
             return format_date(start)
         return f"{format_date(start)} to {format_date(end)}"
     return "N/A"
+
+
+def format_hkd(amount: float, is_price: bool = False) -> str:
+    if amount is None:
+        return "N/A"
+    if is_price:
+        return f"HK${amount:,.2f}"
+    if amount >= 1_000_000_000:
+        return f"HK${amount / 1_000_000_000:.2f}B"
+    if amount >= 1_000_000:
+        return f"HK${amount / 1_000_000:.2f}M"
+    return f"HK${amount:,.0f}"
 
 
 def render_details(selected_date: date, events: List[Dict], enable_filings: bool):
@@ -126,9 +172,26 @@ def render_details(selected_date: date, events: List[Dict], enable_filings: bool
             if item.get("company_page_url"):
                 st.markdown(f"Company page: {item['company_page_url']}")
 
-            details = load_details(company) if enable_filings else {}
+            details = (
+                load_details(
+                    company,
+                    item.get("stock_code", ""),
+                    item.get("prospectus_url", ""),
+                    item.get("announcement_url", ""),
+                    item.get("allotment_url", ""),
+                    item.get("funds_raised_hkd"),
+                    item.get("prospectus_date"),
+                    item.get("listing_date"),
+                )
+                if enable_filings
+                else {}
+            )
             ipo_value = details.get("ipo_value_usd") if enable_filings else None
             raise_amount = details.get("raise_amount_usd") if enable_filings else None
+            if raise_amount is None:
+                funds_raised_hkd = item.get("funds_raised_hkd")
+                if funds_raised_hkd:
+                    raise_amount = convert_to_usd(funds_raised_hkd, "HKD")
             valuation_multiple = details.get("valuation_multiple") if enable_filings else None
 
             col1, col2, col3 = st.columns(3)
@@ -140,7 +203,7 @@ def render_details(selected_date: date, events: List[Dict], enable_filings: bool
                 st.caption("Enable filings fetch to load term sheet details.")
                 continue
 
-            term_sheet_url = details.get("term_sheet_url")
+            term_sheet_url = details.get("term_sheet_url") or item.get("prospectus_url")
             if term_sheet_url:
                 st.markdown(f"Term sheet: {term_sheet_url}")
             else:
@@ -189,8 +252,8 @@ if meta.get("errors"):
     st.caption("; ".join(meta["errors"]))
 
 st.markdown(
-    "<span class='legend bookbuilding'>Bookbuilding</span>"
-    "<span class='legend trade'>Trade</span>",
+    "<span class='legend bookbuilding'>Prospectus/Bookbuilding</span>"
+    "<span class='legend trade'>Listing/Trade</span>",
     unsafe_allow_html=True,
 )
 

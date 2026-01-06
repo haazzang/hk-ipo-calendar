@@ -1,0 +1,29 @@
+[
+  {
+    "company": "Alpha Biotech Holdings",
+    "stock_code": "TBD",
+    "industry": "Biotech",
+    "bookbuilding_start": "2024-09-12",
+    "bookbuilding_end": "2024-09-13",
+    "trade_date": "2024-09-20",
+    "company_page_url": "https://www.hkex.com.hk/"
+  },
+  {
+    "company": "Harbour Logistics Ltd",
+    "stock_code": "TBD",
+    "industry": "Logistics",
+    "bookbuilding_start": "2024-09-18",
+    "bookbuilding_end": "2024-09-19",
+    "trade_date": "2024-09-26",
+    "company_page_url": "https://www.hkex.com.hk/"
+  },
+  {
+    "company": "Jade Renewable Energy",
+    "stock_code": "TBD",
+    "industry": "Renewables",
+    "bookbuilding_start": "2024-10-02",
+    "bookbuilding_end": "2024-10-03",
+    "trade_date": "2024-10-10",
+    "company_page_url": "https://www.hkex.com.hk/"
+  }
+]

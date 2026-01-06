@@ -52,7 +52,10 @@ HKEX_SEARCH_ENDPOINTS = [
 
 DEFAULT_FX_USDHKD = 7.80
 DEFAULT_TIMEOUT = 25
-MAX_PDF_BYTES = 12_000_000
+MAX_PDF_BYTES = 60_000_000
+LONG_PDF_PAGE_THRESHOLD = 80
+SUMMARY_PDF_PAGE_LIMIT = 4
+DEFAULT_PDF_PAGE_LIMIT = 10
 AASTOCKS_BASE = "https://www.aastocks.com"
 AASTOCKS_UPCOMING_IPO_URL = f"{AASTOCKS_BASE}/en/stocks/market/ipo/mainpage.aspx"
 TERM_SHEET_KEYWORDS = [
@@ -272,6 +275,7 @@ def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dic
             try:
                 documents = _fetch_new_listing_documents()
                 _attach_new_listing_documents(items, documents)
+                items.extend(_build_listing_items_from_documents(documents, items))
                 _fill_missing_trade_dates(items)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"HKEX new listing document fetch failed: {exc}")
@@ -563,6 +567,43 @@ def _attach_new_listing_documents(
                 or doc.get("announcement_url")
                 or HKEX_NEW_LISTING_MAIN_URL
             )
+
+
+def _build_listing_items_from_documents(
+    documents: Dict[str, Dict[str, Any]], existing_items: Iterable[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not documents:
+        return []
+    existing_codes = {
+        normalize_stock_code(item.get("stock_code"))
+        for item in existing_items
+        if normalize_stock_code(item.get("stock_code"))
+    }
+    items: List[Dict[str, Any]] = []
+    for stock_code, doc in documents.items():
+        if stock_code in existing_codes:
+            continue
+        items.append(
+            {
+                "company": doc.get("company") or "",
+                "stock_code": stock_code,
+                "industry": "",
+                "bookbuilding_start": None,
+                "bookbuilding_end": None,
+                "bookbuilding_label": "Prospectus",
+                "bookbuilding_type": "bookbuilding",
+                "trade_date": None,
+                "trade_label": "Listing date",
+                "announcement_url": doc.get("announcement_url"),
+                "prospectus_url": doc.get("prospectus_url"),
+                "allotment_url": doc.get("allotment_url"),
+                "company_page_url": doc.get("prospectus_url")
+                or doc.get("announcement_url")
+                or HKEX_NEW_LISTING_MAIN_URL,
+                "source": "hkex-new-listing-table",
+            }
+        )
+    return items
 
 
 def _fill_missing_trade_dates(items: Iterable[Dict[str, Any]]) -> None:
@@ -1289,8 +1330,11 @@ def _extract_text_from_pdf(data: bytes) -> str:
         reader = PdfReader(BytesIO(data))
     except Exception:  # noqa: BLE001
         return ""
+    page_limit = DEFAULT_PDF_PAGE_LIMIT
+    if len(reader.pages) > LONG_PDF_PAGE_THRESHOLD:
+        page_limit = SUMMARY_PDF_PAGE_LIMIT
     texts: List[str] = []
-    for page in reader.pages[:10]:
+    for page in reader.pages[:page_limit]:
         try:
             texts.append(page.extract_text() or "")
         except Exception:  # noqa: BLE001

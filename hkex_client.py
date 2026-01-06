@@ -5,7 +5,9 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import calendar
 import json
+import os
 import re
 
 import requests
@@ -21,7 +23,11 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 SAMPLE_CALENDAR_PATH = DATA_DIR / "sample_ipo_calendar.json"
 OVERRIDES_PATH = DATA_DIR / "overrides.json"
 
-HKEX_IPO_CALENDAR_URL = "https://www.hkex.com.hk/Market-Data/IPO-Activity/IPO-Calendar?sc_lang=en"
+HKEX_IPO_CALENDAR_URLS = [
+    os.getenv("HKEX_IPO_CALENDAR_URL", "").strip(),
+    "https://www.hkex.com.hk/Market-Data/IPO-Activity/IPO-Calendar?sc_lang=en",
+]
+HKEX_IPO_CALENDAR_URLS = [url for url in HKEX_IPO_CALENDAR_URLS if url]
 HKEX_NEWS_HOST = "https://www1.hkexnews.hk"
 HKEX_SEARCH_ENDPOINTS = [
     ("servlet", f"{HKEX_NEWS_HOST}/search/titleSearchServlet.do", "post"),
@@ -116,7 +122,8 @@ def load_sample_calendar() -> List[Dict[str, Any]]:
         return []
     with SAMPLE_CALENDAR_PATH.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
-    return [normalize_calendar_item(item) for item in raw]
+    items = [normalize_calendar_item(item) for item in raw]
+    return _shift_sample_to_recent(items)
 
 
 def load_overrides() -> Dict[str, Dict[str, Any]]:
@@ -139,6 +146,51 @@ def normalize_calendar_item(item: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _month_index(value: date) -> int:
+    return value.year * 12 + value.month
+
+
+def _add_months(value: date, months: int) -> date:
+    year = value.year + (value.month - 1 + months) // 12
+    month = (value.month - 1 + months) % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _shift_item_months(item: Dict[str, Any], months: int) -> Dict[str, Any]:
+    updated = dict(item)
+    for key in ("bookbuilding_start", "bookbuilding_end", "trade_date"):
+        value = item.get(key)
+        if value:
+            updated[key] = _add_months(value, months)
+    return updated
+
+
+def _shift_sample_to_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not items:
+        return items
+    dates = [
+        value
+        for item in items
+        for value in (
+            item.get("bookbuilding_start"),
+            item.get("bookbuilding_end"),
+            item.get("trade_date"),
+        )
+        if value
+    ]
+    if not dates:
+        return items
+    latest = max(dates)
+    if latest >= date.today() - timedelta(days=60):
+        return items
+    earliest = min(dates)
+    delta_months = _month_index(date.today()) - _month_index(earliest)
+    if delta_months == 0:
+        return items
+    return [_shift_item_months(item, delta_months) for item in items]
+
+
 def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     errors: List[str] = []
     if use_live:
@@ -154,11 +206,20 @@ def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dic
 
 def _fetch_ipo_calendar_hkex() -> List[Dict[str, Any]]:
     session = _session()
-    response = session.get(HKEX_IPO_CALENDAR_URL, timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    html = response.text
-    items = _extract_calendar_from_html(html)
-    return items
+    last_error: Optional[str] = None
+    for url in HKEX_IPO_CALENDAR_URLS:
+        response = session.get(url, timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 404:
+            last_error = f"HKEX IPO calendar endpoint not found (404): {url}"
+            continue
+        response.raise_for_status()
+        items = _extract_calendar_from_html(response.text)
+        if items:
+            return items
+        last_error = f"HKEX calendar returned empty data from {url}"
+    if last_error:
+        raise RuntimeError(last_error)
+    raise RuntimeError("HKEX IPO calendar endpoint list is empty.")
 
 
 def _extract_calendar_from_html(html: str) -> List[Dict[str, Any]]:

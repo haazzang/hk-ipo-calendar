@@ -66,6 +66,7 @@ TERM_SHEET_KEYWORDS = [
     "allotment results",
 ]
 TERM_SHEET_MAX_PDFS = 3
+LISTING_DATE_LOOKUP_LIMIT = 20
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -271,6 +272,7 @@ def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dic
             try:
                 documents = _fetch_new_listing_documents()
                 _attach_new_listing_documents(items, documents)
+                _fill_missing_trade_dates(items)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"HKEX new listing document fetch failed: {exc}")
             items = _dedupe_calendar_items(items)
@@ -561,6 +563,64 @@ def _attach_new_listing_documents(
                 or doc.get("announcement_url")
                 or HKEX_NEW_LISTING_MAIN_URL
             )
+
+
+def _fill_missing_trade_dates(items: Iterable[Dict[str, Any]]) -> None:
+    if PdfReader is None:
+        return
+    lookups = 0
+    cutoff = date.today() - timedelta(days=365)
+    for item in items:
+        if lookups >= LISTING_DATE_LOOKUP_LIMIT:
+            break
+        if item.get("trade_date"):
+            continue
+        if item.get("bookbuilding_type") == "application":
+            continue
+        reference_date = item.get("bookbuilding_start") or item.get("prospectus_date")
+        if reference_date and reference_date < cutoff:
+            continue
+        for url in (item.get("prospectus_url"), item.get("announcement_url")):
+            if not url or not url.lower().endswith(".pdf"):
+                continue
+            listing_date = extract_listing_date_from_pdf(url)
+            if listing_date:
+                item["trade_date"] = listing_date
+                item.setdefault("trade_label", "Listing date")
+                break
+        lookups += 1
+
+
+def extract_listing_date_from_pdf(url: str) -> Optional[date]:
+    if PdfReader is None:
+        return None
+    try:
+        data = _download_pdf(url)
+    except Exception:  # noqa: BLE001
+        return None
+    if not data:
+        return None
+    text = _extract_text_from_pdf(data)
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text)
+    return _extract_listing_date_from_text(text)
+
+
+def _extract_listing_date_from_text(text: str) -> Optional[date]:
+    patterns = [
+        r"(?:Listing Date|Expected Listing Date)[^\d]{0,40}([0-3]?\d\s+[A-Za-z]{3,9}\s+20\d{2})",
+        r"(?:Listing Date|Expected Listing Date)[^\d]{0,40}(\d{1,2}/\d{1,2}/20\d{2})",
+        r"(?:Listing Date|Expected Listing Date)[^\d]{0,40}(\d{4}-\d{1,2}-\d{1,2})",
+        r"Dealings in the Shares are expected to commence on[^\d]{0,40}([0-3]?\d\s+[A-Za-z]{3,9}\s+20\d{2})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            parsed = safe_parse_date(match.group(1))
+            if parsed:
+                return parsed
+    return None
 
 
 def _dedupe_calendar_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -923,14 +983,40 @@ def fetch_ipo_details(item: Dict[str, Any]) -> Dict[str, Any]:
         if funds_raised_hkd is not None:
             raise_amount_usd = convert_to_usd(funds_raised_hkd, "HKD")
 
+    offer_price = extracted_terms.get("offer_price")
+    shares_issued = extracted_terms.get("shares_issued")
+    market_cap_usd = None
+    market_cap = extracted_terms.get("market_cap")
+    if market_cap:
+        market_cap_usd = convert_to_usd(market_cap[0], market_cap[1])
+    elif offer_price and shares_issued:
+        offer_price_value, offer_price_currency = offer_price
+        market_cap = (offer_price_value * shares_issued, offer_price_currency)
+        market_cap_usd = convert_to_usd(market_cap[0], market_cap[1])
+    elif shares_issued:
+        fallback_price = _parse_float(item.get("subscription_price_hkd"))
+        if fallback_price is None:
+            fallback_price = _parse_float(item.get("offer_price_text"))
+        if fallback_price is not None:
+            market_cap = (fallback_price * shares_issued, "HKD")
+            market_cap_usd = convert_to_usd(fallback_price * shares_issued, "HKD")
+
+    ipo_value_usd = extracted_terms.get("ipo_value_usd")
+    if ipo_value_usd is None:
+        ipo_value_usd = market_cap_usd
+
     return {
         "term_sheet_url": term_sheet.url if term_sheet else None,
         "filings": [filing.__dict__ for filing in filings[:6]],
-        "ipo_value_usd": extracted_terms.get("ipo_value_usd"),
+        "ipo_value_usd": ipo_value_usd,
         "raise_amount_usd": raise_amount_usd,
         "valuation_multiple": extracted_terms.get("valuation_multiple"),
         "business_model": extracted_terms.get("business_model"),
         "financial_trend": extracted_terms.get("financial_trend"),
+        "offer_price": offer_price,
+        "shares_issued": shares_issued,
+        "market_cap": market_cap,
+        "market_cap_usd": market_cap_usd,
     }
 
 
@@ -1140,6 +1226,9 @@ def extract_terms_from_pdf(url: str) -> Dict[str, Any]:
     gross_proceeds = _extract_gross_proceeds(text)
     market_cap = _extract_market_cap(text)
     valuation_multiple = _extract_valuation_multiple(text)
+    shares_issued = _extract_share_count(text)
+    if offer_price and shares_issued:
+        market_cap = (offer_price[0] * shares_issued, offer_price[1])
 
     business_model = extract_summary(
         text,
@@ -1172,6 +1261,7 @@ def extract_terms_from_pdf(url: str) -> Dict[str, Any]:
         "gross_proceeds": gross_proceeds,
         "market_cap": market_cap,
         "valuation_multiple": valuation_multiple,
+        "shares_issued": shares_issued,
         "business_model": business_model,
         "financial_trend": financial_trend,
         "ipo_value_usd": ipo_value_usd,
@@ -1248,6 +1338,32 @@ def _extract_market_cap(text: str) -> Optional[Tuple[float, str]]:
     if match:
         return _parse_money(match.group(2), match.group(1), match.group(3))
     return None
+
+
+def _extract_share_count(text: str) -> Optional[float]:
+    patterns = [
+        r"(?:Shares in issue(?: immediately (?:following|after)[^\\.]{0,60}?)?)"
+        r"[^\d]{0,40}([0-9,.]+)\s*(million|billion|mn|bn)?\s+Shares",
+        r"(?:Number of Offer Shares|Offer Shares|Shares offered)"
+        r"[^\d]{0,40}([0-9,.]+)\s*(million|billion|mn|bn)?\s+Shares",
+    ]
+    counts: List[float] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            count = _parse_share_count(match.group(1), match.group(2))
+            if count:
+                counts.append(count)
+    if counts:
+        return max(counts)
+    return None
+
+
+def _parse_share_count(value: str, unit: Optional[str]) -> Optional[float]:
+    try:
+        clean_value = float(value.replace(",", ""))
+    except ValueError:
+        return None
+    return clean_value * _unit_multiplier(unit)
 
 
 def _extract_valuation_multiple(text: str) -> Optional[str]:

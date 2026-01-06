@@ -97,7 +97,8 @@ def format_date(value: date) -> str:
     return value.strftime("%Y-%m-%d") if value else "N/A"
 
 
-def build_terms_table(item: Dict) -> Dict:
+def build_terms_table(item: Dict, details: Dict | None = None) -> Dict:
+    details = details or {}
     bookbuilding_label = item.get("bookbuilding_label", "Bookbuilding")
     trade_label = item.get("trade_label", "Trade date")
     terms = {
@@ -118,6 +119,9 @@ def build_terms_table(item: Dict) -> Dict:
     offer_price_text = item.get("offer_price_text")
     if offer_price_text and not subscription_price_hkd:
         terms["IPO price (HKD)"] = offer_price_text
+    offer_price = details.get("offer_price")
+    if offer_price and not subscription_price_hkd and not offer_price_text:
+        terms["IPO price"] = format_currency_amount(offer_price)
     lot_size = item.get("lot_size")
     if lot_size:
         terms["Lot size"] = lot_size
@@ -128,6 +132,15 @@ def build_terms_table(item: Dict) -> Dict:
         terms["Application board"] = item.get("application_board")
     if item.get("application_status"):
         terms["Application status"] = item.get("application_status")
+    shares_issued = details.get("shares_issued")
+    if shares_issued:
+        terms["Shares issued"] = format_shares(shares_issued)
+    market_cap = details.get("market_cap")
+    if market_cap:
+        terms["Market cap"] = format_currency_amount(market_cap)
+    valuation_multiple = details.get("valuation_multiple")
+    if valuation_multiple:
+        terms["Valuation multiple"] = valuation_multiple
     return terms
 
 
@@ -151,6 +164,27 @@ def format_hkd(amount: float, is_price: bool = False) -> str:
     return f"HK${amount:,.0f}"
 
 
+def format_shares(amount: float) -> str:
+    if amount >= 1_000_000_000:
+        return f"{amount / 1_000_000_000:.2f}B shares"
+    if amount >= 1_000_000:
+        return f"{amount / 1_000_000:.2f}M shares"
+    return f"{amount:,.0f} shares"
+
+
+def format_currency_amount(value) -> str:
+    if not value or len(value) != 2:
+        return "N/A"
+    amount, currency = value
+    precision = 2 if amount < 1000 else 0
+    formatted = f"{amount:,.{precision}f}"
+    if currency == "HKD":
+        return f"HK${formatted}"
+    if currency == "USD":
+        return f"${formatted}"
+    return f"{currency} {formatted}"
+
+
 def render_details(selected_date: date, events: List[Dict], enable_filings: bool):
     if not events:
         st.info("No IPO events on this date.")
@@ -162,22 +196,22 @@ def render_details(selected_date: date, events: List[Dict], enable_filings: bool
         company = item.get("company", "Unknown")
         header = f"{company} - {event['label']}"
         with st.expander(header, expanded=True):
-            terms = build_terms_table(item)
+            details = load_details(item) if enable_filings else {}
+            terms = build_terms_table(item, details if enable_filings else None)
             st.table(terms)
             if item.get("company_page_url"):
                 st.markdown(f"Company page: {item['company_page_url']}")
-
-            details = load_details(item) if enable_filings else {}
             ipo_value = details.get("ipo_value_usd") if enable_filings else None
             raise_amount = details.get("raise_amount_usd") if enable_filings else None
             if raise_amount is None:
                 funds_raised_hkd = item.get("funds_raised_hkd")
                 if funds_raised_hkd:
                     raise_amount = convert_to_usd(funds_raised_hkd, "HKD")
+            market_cap = details.get("market_cap_usd") or ipo_value
             valuation_multiple = details.get("valuation_multiple") if enable_filings else None
 
             col1, col2, col3 = st.columns(3)
-            col1.metric("IPO value (USD)", format_money(ipo_value))
+            col1.metric("Market cap (USD)", format_money(market_cap))
             col2.metric("Raise amount (USD)", format_money(raise_amount))
             col3.metric("Valuation multiple", valuation_multiple or "N/A")
 

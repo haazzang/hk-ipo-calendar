@@ -1188,14 +1188,17 @@ def _download_pdf(url: str) -> bytes:
         if chunk:
             content.extend(chunk)
         if len(content) > MAX_PDF_BYTES:
-            break
+            return b""
     return bytes(content)
 
 
 def _extract_text_from_pdf(data: bytes) -> str:
     if PdfReader is None:
         return ""
-    reader = PdfReader(BytesIO(data))
+    try:
+        reader = PdfReader(BytesIO(data))
+    except Exception:  # noqa: BLE001
+        return ""
     texts: List[str] = []
     for page in reader.pages[:10]:
         try:

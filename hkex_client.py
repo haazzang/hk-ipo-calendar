@@ -41,9 +41,9 @@ HKEX_NEW_LISTING_MAIN_URL = (
 )
 HKEX_NEW_LISTING_REPORT_SEGMENT = "/New-Listing-Report/Main/"
 HKEX_APPLICATION_PROOF_URL = "https://www1.hkexnews.hk/app/appindex.html"
-HKEX_APPLICATION_INDEX_URLS = [
-    ("Main Board", "https://www1.hkexnews.hk/app/documents/sehkconsolidatedindex.xlsx"),
-    ("GEM", "https://www1.hkexnews.hk/app/documents/gemconsolidatedindex.xlsx"),
+HKEX_APPLICATION_JSON_URLS = [
+    ("Main Board", "https://www1.hkexnews.hk/ncms/json/eds/appactive_app_sehk_e.json"),
+    ("GEM", "https://www1.hkexnews.hk/ncms/json/eds/appactive_app_gem_e.json"),
 ]
 HKEX_SEARCH_ENDPOINTS = [
     ("servlet", f"{HKEX_NEWS_HOST}/search/titleSearchServlet.do", "post"),
@@ -53,6 +53,19 @@ HKEX_SEARCH_ENDPOINTS = [
 DEFAULT_FX_USDHKD = 7.80
 DEFAULT_TIMEOUT = 25
 MAX_PDF_BYTES = 12_000_000
+AASTOCKS_BASE = "https://www.aastocks.com"
+AASTOCKS_UPCOMING_IPO_URL = f"{AASTOCKS_BASE}/en/stocks/market/ipo/mainpage.aspx"
+TERM_SHEET_KEYWORDS = [
+    "application proof",
+    "phip",
+    "term sheet",
+    "hearing information pack",
+    "offering circular",
+    "prospectus",
+    "announcement",
+    "allotment results",
+]
+TERM_SHEET_MAX_PDFS = 3
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -95,6 +108,22 @@ def safe_parse_date(value: Any) -> Optional[date]:
         return date_parser.parse(text, dayfirst=True).date()
     except (ValueError, TypeError):
         return None
+
+
+def parse_ymd_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+    return safe_parse_date(text)
 
 
 def _parse_compact_range(text: str) -> Optional[Tuple[date, date]]:
@@ -231,9 +260,20 @@ def fetch_ipo_calendar(use_live: bool = True) -> Tuple[List[Dict[str, Any]], Dic
         except Exception as exc:  # noqa: BLE001
             errors.append(f"HKEX new listing report fetch failed: {exc}")
         try:
+            items.extend(_fetch_aastocks_upcoming_calendar())
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"AASTOCKS upcoming IPO fetch failed: {exc}")
+        try:
             items.extend(_fetch_application_proof_items())
         except Exception as exc:  # noqa: BLE001
             errors.append(f"HKEX application proof fetch failed: {exc}")
+        if items:
+            try:
+                documents = _fetch_new_listing_documents()
+                _attach_new_listing_documents(items, documents)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"HKEX new listing document fetch failed: {exc}")
+            items = _dedupe_calendar_items(items)
         if items:
             return items, {"source": "hkex-news", "errors": errors}
         try:
@@ -273,55 +313,29 @@ def _fetch_new_listing_report_calendar() -> List[Dict[str, Any]]:
     html = response.text
 
     report_links = _extract_listing_report_links(html)
-    documents = _extract_new_listing_documents(html)
     items: List[Dict[str, Any]] = []
 
     for link in report_links:
         items.extend(_parse_listing_report(link))
-
-    if documents:
-        for item in items:
-            code = normalize_stock_code(item.get("stock_code"))
-            doc = documents.get(code)
-            if not doc:
-                continue
-            item.update(doc)
-            if not item.get("company") and doc.get("company"):
-                item["company"] = doc["company"]
-            if not item.get("company_page_url"):
-                item["company_page_url"] = (
-                    doc.get("prospectus_url")
-                    or doc.get("announcement_url")
-                    or HKEX_NEW_LISTING_MAIN_URL
-                )
 
     items = [normalize_calendar_item(item) for item in items]
     return items
 
 
 def _fetch_application_proof_items() -> List[Dict[str, Any]]:
-    if pd is None:
-        raise RuntimeError("pandas/openpyxl not available for application proof index")
     session = _session()
     items: List[Dict[str, Any]] = []
-    for board, url in HKEX_APPLICATION_INDEX_URLS:
+    for board, url in HKEX_APPLICATION_JSON_URLS:
         response = session.get(url, timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
-        try:
-            df = pd.read_excel(BytesIO(response.content))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to parse application proof index: {exc}") from exc
-        date_col = _find_column(df, ["Date of First Posting"])
-        applicant_col = _find_column(df, ["Applicant"])
-        status_col = _find_column(df, ["Status"])
-        if not date_col or not applicant_col:
-            continue
-        for _, row in df.iterrows():
-            posting_date = safe_parse_date(row.get(date_col))
-            applicant = str(row.get(applicant_col) or "").strip()
-            status = str(row.get(status_col) or "").strip() if status_col else ""
+        payload = response.json()
+        for record in payload.get("app", []):
+            posting_date = safe_parse_date(record.get("d") or record.get("postingDate"))
+            applicant = str(record.get("a") or "").strip()
             if not applicant or not posting_date:
                 continue
+            status = _application_status_label(record.get("s"))
+            documents = _parse_application_documents(record)
             items.append(
                 {
                     "company": applicant,
@@ -330,6 +344,7 @@ def _fetch_application_proof_items() -> List[Dict[str, Any]]:
                     "application_status": status,
                     "application_board": board,
                     "application_proof_date": posting_date,
+                    "application_documents": documents,
                     "bookbuilding_start": posting_date,
                     "bookbuilding_end": posting_date,
                     "bookbuilding_label": "Application proof",
@@ -343,13 +358,227 @@ def _fetch_application_proof_items() -> List[Dict[str, Any]]:
     return items
 
 
-def _find_column(df: Any, candidates: List[str]) -> Optional[str]:
-    columns = {str(col).strip().lower(): col for col in df.columns}
-    for candidate in candidates:
-        key = candidate.strip().lower()
-        if key in columns:
-            return columns[key]
+def _application_status_label(value: Optional[str]) -> str:
+    mapping = {
+        "A": "Active",
+        "I": "Inactive",
+        "L": "Listed",
+        "R": "Returned",
+    }
+    if not value:
+        return "Unknown"
+    return mapping.get(str(value).strip().upper(), str(value))
+
+
+def _parse_application_documents(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    warning_path = record.get("w")
+    if warning_path:
+        documents.append(
+            {
+                "title": "Warning statement",
+                "url": _normalize_app_url(warning_path),
+                "published_date": safe_parse_date(record.get("d")),
+                "source": "hkex-application-proof",
+            }
+        )
+    for group in (record.get("ls") or []) + (record.get("ps") or []):
+        documents.extend(_parse_application_doc_group(group))
+    return documents
+
+
+def _parse_application_doc_group(group: Dict[str, Any]) -> List[Dict[str, Any]]:
+    docs: List[Dict[str, Any]] = []
+    base_title = str(group.get("nF") or "").strip()
+    published = safe_parse_date(group.get("d"))
+    url_keys = sorted(key for key in group.keys() if key.startswith("u"))
+    for key in url_keys:
+        path = group.get(key)
+        if not path:
+            continue
+        suffix_key = f"nS{key[1:]}"
+        suffix = str(group.get(suffix_key) or "").strip()
+        title_parts = [part for part in (base_title, suffix) if part]
+        title = " - ".join(title_parts) if title_parts else "Application proof"
+        docs.append(
+            {
+                "title": title,
+                "url": _normalize_app_url(path),
+                "published_date": published,
+                "source": "hkex-application-proof",
+            }
+        )
+    return docs
+
+
+def _normalize_app_url(path: str) -> str:
+    if path.startswith("http"):
+        return path
+    return urljoin("https://www1.hkexnews.hk/app/", path.lstrip("/"))
+
+
+def _fetch_aastocks_upcoming_calendar() -> List[Dict[str, Any]]:
+    session = _session()
+    response = session.get(AASTOCKS_UPCOMING_IPO_URL, timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    table = _find_aastocks_upcoming_table(soup)
+    if table is None:
+        return []
+    items: List[Dict[str, Any]] = []
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 7:
+            continue
+        name_cell = cells[0]
+        link = name_cell.find("a", href=True)
+        company = _clean_text(link.get_text(" ", strip=True)) if link else ""
+        summary_url = urljoin(AASTOCKS_BASE, link["href"]) if link else None
+        stock_code = normalize_stock_code(_extract_stock_code(name_cell))
+        if not company or company.lower() == "name/code":
+            continue
+        if stock_code and stock_code.lower() == "stock":
+            continue
+        industry = _clean_text(cells[1].get_text(" ", strip=True))
+        offer_price_text = _clean_text(cells[2].get_text(" ", strip=True))
+        lot_size = _clean_text(cells[3].get_text(" ", strip=True))
+        entry_fee_text = _clean_text(cells[4].get_text(" ", strip=True))
+        closing_date = parse_ymd_date(cells[5].get_text(" ", strip=True))
+        listing_date = parse_ymd_date(cells[6].get_text(" ", strip=True))
+        offer_period_text = _fetch_aastocks_offer_period(session, summary_url) if summary_url else None
+        book_start, book_end = _parse_aastocks_offer_period(offer_period_text, closing_date)
+        book_label = "Offer period" if offer_period_text else "Offer close"
+        item = {
+            "company": company,
+            "stock_code": stock_code,
+            "industry": industry,
+            "bookbuilding_start": book_start,
+            "bookbuilding_end": book_end,
+            "bookbuilding_label": book_label,
+            "bookbuilding_type": "bookbuilding",
+            "trade_date": listing_date,
+            "trade_label": "Listing date",
+            "offer_price_text": offer_price_text,
+            "lot_size": lot_size,
+            "entry_fee_text": entry_fee_text,
+            "schedule_source_url": summary_url,
+            "company_page_url": HKEX_NEW_LISTING_MAIN_URL,
+            "source": "aastocks",
+        }
+        if offer_price_text:
+            price_value = _parse_float(offer_price_text)
+            if price_value is not None:
+                item["subscription_price_hkd"] = price_value
+        items.append(item)
+    return items
+
+
+def _find_aastocks_upcoming_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+    for table in soup.find_all("table"):
+        header = table.find("thead")
+        if not header:
+            continue
+        cells = header.find_all("td")
+        headers = [_clean_text(cell.get_text(" ", strip=True)) for cell in cells]
+        if "Closing Date" in headers and "Listing Date" in headers:
+            return table
     return None
+
+
+def _fetch_aastocks_offer_period(session: requests.Session, url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    response = session.get(url, timeout=DEFAULT_TIMEOUT)
+    if not response.ok:
+        return None
+    match = re.search(r"Offer Period</td>\s*<td[^>]*>(.*?)</td>", response.text, re.S)
+    if not match:
+        return None
+    return _clean_text(re.sub(r"<.*?>", " ", match.group(1)))
+
+
+def _parse_aastocks_offer_period(
+    offer_period_text: Optional[str], closing_date: Optional[date]
+) -> Tuple[Optional[date], Optional[date]]:
+    if offer_period_text:
+        matches = re.findall(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", offer_period_text)
+        if len(matches) >= 2:
+            start = parse_ymd_date(matches[0])
+            end = parse_ymd_date(matches[1])
+            if start or end:
+                return start, end
+        if len(matches) == 1:
+            single = parse_ymd_date(matches[0])
+            if single:
+                return single, single
+    if closing_date:
+        return closing_date, closing_date
+    return None, None
+
+
+def _extract_stock_code(cell: BeautifulSoup) -> str:
+    span = cell.find("span", class_="cls")
+    if span:
+        return span.get_text(strip=True)
+    text = cell.get_text(" ", strip=True)
+    match = re.search(r"(\d{4,5})\.HK", text)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _clean_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _fetch_new_listing_documents() -> Dict[str, Dict[str, Any]]:
+    session = _session()
+    response = session.get(HKEX_NEW_LISTING_MAIN_URL, timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    return _extract_new_listing_documents(response.text)
+
+
+def _attach_new_listing_documents(
+    items: Iterable[Dict[str, Any]], documents: Dict[str, Dict[str, Any]]
+) -> None:
+    if not documents:
+        return
+    for item in items:
+        code = normalize_stock_code(item.get("stock_code"))
+        if not code:
+            continue
+        doc = documents.get(code)
+        if not doc:
+            continue
+        item.setdefault("announcement_url", doc.get("announcement_url"))
+        item.setdefault("prospectus_url", doc.get("prospectus_url"))
+        item.setdefault("allotment_url", doc.get("allotment_url"))
+        if not item.get("company"):
+            item["company"] = doc.get("company")
+        if not item.get("company_page_url"):
+            item["company_page_url"] = (
+                doc.get("prospectus_url")
+                or doc.get("announcement_url")
+                or HKEX_NEW_LISTING_MAIN_URL
+            )
+
+
+def _dedupe_calendar_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    unique: List[Dict[str, Any]] = []
+    for item in items:
+        key = (
+            normalize_stock_code(item.get("stock_code")),
+            item.get("trade_date"),
+            item.get("bookbuilding_start"),
+            normalize_company_key(item.get("company", "")),
+            item.get("bookbuilding_type"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def _extract_listing_report_links(html: str) -> List[str]:
@@ -364,7 +593,7 @@ def _extract_listing_report_links(html: str) -> List[str]:
         links.append(urljoin(HKEX_NEWS_BASE, href))
 
     def sort_key(url: str) -> int:
-        match = re.search(r"(\\d{4})", url)
+        match = re.search(r"(\d{4})", url)
         return int(match.group(1)) if match else 0
 
     return sorted(set(links), key=sort_key, reverse=True)
@@ -639,7 +868,21 @@ def fetch_ipo_details(item: Dict[str, Any]) -> Dict[str, Any]:
     announcement_url = item.get("announcement_url")
     prospectus_url = item.get("prospectus_url")
     allotment_url = item.get("allotment_url")
+    application_documents = item.get("application_documents") or []
 
+    for document in application_documents:
+        url = document.get("url")
+        title = document.get("title")
+        if not url or not title:
+            continue
+        filings.append(
+            Filing(
+                title=title,
+                url=url,
+                published_date=safe_parse_date(document.get("published_date")),
+                source=document.get("source") or "hkex-application-proof",
+            )
+        )
     if announcement_url:
         filings.append(
             Filing(
@@ -672,10 +915,7 @@ def fetch_ipo_details(item: Dict[str, Any]) -> Dict[str, Any]:
         filings.extend(search_hkex_filings(company))
     filings = _dedupe_filings(filings)
     term_sheet = select_term_sheet(filings)
-    extracted_terms: Dict[str, Any] = {}
-
-    if term_sheet and term_sheet.url.lower().endswith(".pdf"):
-        extracted_terms = extract_terms_from_pdf(term_sheet.url)
+    extracted_terms = extract_terms_from_filings(filings) if filings else {}
 
     raise_amount_usd = extracted_terms.get("raise_amount_usd")
     if raise_amount_usd is None:
@@ -829,18 +1069,57 @@ def _dedupe_filings(filings: List[Filing]) -> List[Filing]:
 
 
 def select_term_sheet(filings: List[Filing]) -> Optional[Filing]:
-    keywords = [
-        "prospectus",
-        "application proof",
-        "hearing information pack",
-        "term sheet",
-        "offering circular",
-    ]
-    for filing in filings:
-        title = filing.title.lower()
-        if any(keyword in title for keyword in keywords):
-            return filing
-    return filings[0] if filings else None
+    if not filings:
+        return None
+    return min(filings, key=_term_sheet_rank)
+
+
+def _term_sheet_rank(filing: Filing) -> Tuple[int, int, int]:
+    title = filing.title.lower()
+    keyword_rank = next(
+        (idx for idx, keyword in enumerate(TERM_SHEET_KEYWORDS) if keyword in title),
+        len(TERM_SHEET_KEYWORDS),
+    )
+    source_rank = 0 if filing.source == "hkex-application-proof" else 1
+    date_rank = -(filing.published_date or date.min).toordinal()
+    return keyword_rank, source_rank, date_rank
+
+
+def extract_terms_from_filings(filings: List[Filing]) -> Dict[str, Any]:
+    if not filings:
+        return {}
+    extracted: Dict[str, Any] = {}
+    checked = set()
+    for filing in sorted(filings, key=_term_sheet_rank):
+        if len(checked) >= TERM_SHEET_MAX_PDFS:
+            break
+        url = filing.url
+        if not url or not url.lower().endswith(".pdf"):
+            continue
+        if url in checked:
+            continue
+        checked.add(url)
+        terms = extract_terms_from_pdf(url)
+        if not terms:
+            continue
+        for key, value in terms.items():
+            if value is None:
+                continue
+            extracted.setdefault(key, value)
+        if _has_enough_term_fields(extracted):
+            break
+    return extracted
+
+
+def _has_enough_term_fields(terms: Dict[str, Any]) -> bool:
+    keys = (
+        "ipo_value_usd",
+        "raise_amount_usd",
+        "valuation_multiple",
+        "business_model",
+        "financial_trend",
+    )
+    return sum(1 for key in keys if terms.get(key)) >= 3
 
 
 def extract_terms_from_pdf(url: str) -> Dict[str, Any]:
@@ -862,8 +1141,23 @@ def extract_terms_from_pdf(url: str) -> Dict[str, Any]:
     market_cap = _extract_market_cap(text)
     valuation_multiple = _extract_valuation_multiple(text)
 
-    business_model = extract_summary(text, keywords=["our business", "we are", "we provide"], max_sentences=2)
-    financial_trend = extract_summary(text, keywords=["revenue", "profit", "loss", "gross"], max_sentences=2)
+    business_model = extract_summary(
+        text,
+        keywords=["our business", "business model", "principal activities", "we are", "we provide"],
+        max_sentences=2,
+    )
+    financial_trend = extract_summary(
+        text,
+        keywords=[
+            "revenue",
+            "profit",
+            "loss",
+            "gross",
+            "financial information",
+            "operating results",
+        ],
+        max_sentences=2,
+    )
 
     ipo_value_usd = None
     if market_cap:
@@ -903,7 +1197,7 @@ def _extract_text_from_pdf(data: bytes) -> str:
         return ""
     reader = PdfReader(BytesIO(data))
     texts: List[str] = []
-    for page in reader.pages[:5]:
+    for page in reader.pages[:10]:
         try:
             texts.append(page.extract_text() or "")
         except Exception:  # noqa: BLE001

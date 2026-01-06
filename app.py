@@ -59,28 +59,8 @@ def load_calendar(use_live: bool):
 
 
 @st.cache_data(ttl=1800)
-def load_details(
-    company: str,
-    stock_code: str,
-    prospectus_url: str,
-    announcement_url: str,
-    allotment_url: str,
-    funds_raised_hkd: float,
-    prospectus_date: date,
-    listing_date: date,
-) -> Dict:
-    return fetch_ipo_details(
-        {
-            "company": company,
-            "stock_code": stock_code,
-            "prospectus_url": prospectus_url,
-            "announcement_url": announcement_url,
-            "allotment_url": allotment_url,
-            "funds_raised_hkd": funds_raised_hkd,
-            "prospectus_date": prospectus_date,
-            "listing_date": listing_date,
-        }
-    )
+def load_details(item: Dict) -> Dict:
+    return fetch_ipo_details(item)
 
 
 def truncate_text(value: str, max_len: int = 16) -> str:
@@ -135,6 +115,15 @@ def build_terms_table(item: Dict) -> Dict:
     subscription_price_hkd = item.get("subscription_price_hkd")
     if subscription_price_hkd:
         terms["IPO price (HKD)"] = format_hkd(subscription_price_hkd, is_price=True)
+    offer_price_text = item.get("offer_price_text")
+    if offer_price_text and not subscription_price_hkd:
+        terms["IPO price (HKD)"] = offer_price_text
+    lot_size = item.get("lot_size")
+    if lot_size:
+        terms["Lot size"] = lot_size
+    entry_fee_text = item.get("entry_fee_text")
+    if entry_fee_text:
+        terms["Entry fee (HKD)"] = entry_fee_text
     if item.get("application_board"):
         terms["Application board"] = item.get("application_board")
     if item.get("application_status"):
@@ -178,20 +167,7 @@ def render_details(selected_date: date, events: List[Dict], enable_filings: bool
             if item.get("company_page_url"):
                 st.markdown(f"Company page: {item['company_page_url']}")
 
-            details = (
-                load_details(
-                    company,
-                    item.get("stock_code", ""),
-                    item.get("prospectus_url", ""),
-                    item.get("announcement_url", ""),
-                    item.get("allotment_url", ""),
-                    item.get("funds_raised_hkd"),
-                    item.get("prospectus_date"),
-                    item.get("listing_date"),
-                )
-                if enable_filings
-                else {}
-            )
+            details = load_details(item) if enable_filings else {}
             ipo_value = details.get("ipo_value_usd") if enable_filings else None
             raise_amount = details.get("raise_amount_usd") if enable_filings else None
             if raise_amount is None:
@@ -272,17 +248,16 @@ render_calendar(year, month, all_events)
 selected_events = all_events.get(selected_date, [])
 render_details(selected_date, selected_events, enable_filings)
 
-application_only = [
-    item
-    for item in items
-    if item.get("bookbuilding_type") == "application" and not item.get("trade_date")
-]
+application_only = [item for item in items if not item.get("trade_date")]
 if application_only:
-    st.subheader("Application proof (no listing date yet)")
+    st.subheader("No listing date yet")
     rows = [
         {
             "Company": item.get("company", "Unknown"),
             "First posting": format_date(item.get("bookbuilding_start")),
+            "Category": "Application proof"
+            if item.get("bookbuilding_type") == "application"
+            else (item.get("bookbuilding_label") or "N/A"),
             "Board": item.get("application_board") or "N/A",
             "Status": item.get("application_status") or "N/A",
         }
